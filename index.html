@@ -245,21 +245,48 @@ function openChannel(ent) {
   load(true);
 }
 
+// Vídeos subidos como vídeo (filtro Video) y como archivo normal (filtro Document), fusionados por id descendente.
+const VID_EXT = /\.(mp4|m4v|mkv|webm|mov|avi|wmv|flv|mpe?g|ts|m2ts|mts|3gp|ogv|vob|divx|rmvb)$/i;
+const EXT_MIME = { mkv: "video/x-matroska", avi: "video/x-msvideo", mov: "video/quicktime", webm: "video/webm", ts: "video/mp2t", m2ts: "video/mp2t", mts: "video/mp2t", wmv: "video/x-ms-wmv", flv: "video/x-flv", mpg: "video/mpeg", mpeg: "video/mpeg", "3gp": "video/3gpp", ogv: "video/ogg" };
+function isVideoDoc(m) {
+  const d = m.media && m.media.document;
+  if (!d) return false;
+  if (/^video\//.test(d.mimeType || "") || d.mimeType === "application/x-matroska") return true;
+  return (d.attributes || []).some((a) => a.className === "DocumentAttributeVideo" || (a.className === "DocumentAttributeFilename" && VID_EXT.test(a.fileName || "")));
+}
+let srcs = [], seen = new Set();
+const newSrcs = () => [Api.InputMessagesFilterVideo, Api.InputMessagesFilterDocument].map((F) => ({ F, offset: 0, done: false, buf: [] }));
+async function fill(src, my) {
+  if (src.buf.length || src.done) return;
+  const params = { limit: PAGE, offsetId: src.offset, filter: new src.F() };
+  if (query) params.search = query;
+  const batch = await client.getMessages(entity, params);
+  if (my !== gen) return;
+  if (batch.length) src.offset = batch[batch.length - 1].id;
+  if (batch.length < PAGE) src.done = true;
+  src.buf = Array.from(batch);
+}
+
 async function load(reset) {
   if (!entity || (loading && !reset) || (!reset && done)) return;
-  if (reset) { gen++; offsetId = 0; done = false; $("#grid").innerHTML = ""; thumbQueue.length = 0; }
+  if (reset) { gen++; srcs = newSrcs(); seen = new Set(); done = false; $("#grid").innerHTML = ""; thumbQueue.length = 0; }
   const my = gen; loading = true;
   $("#more").classList.add("hidden");
   $("#status").textContent = "Buscando vídeos…";
   try {
-    const params = { limit: PAGE, offsetId, filter: new Api.InputMessagesFilterVideo() };
-    if (query) params.search = query;
-    const batch = await client.getMessages(entity, params);
-    if (my !== gen) return;
-    const vids = batch.filter((m) => m.media && m.media.document);
-    for (const m of vids) $("#grid").appendChild(card(m));
-    if (batch.length) offsetId = batch[batch.length - 1].id;
-    done = batch.length < PAGE;
+    const out = [];
+    while (out.length < PAGE) {
+      await Promise.all(srcs.map((s) => fill(s, my)));
+      if (my !== gen) return;
+      const live = srcs.filter((s) => s.buf.length);
+      if (!live.length) break;
+      const s = live.reduce((a, b) => (a.buf[0].id >= b.buf[0].id ? a : b));
+      const m = s.buf.shift();
+      if (seen.has(m.id) || !isVideoDoc(m)) continue;
+      seen.add(m.id); out.push(m);
+    }
+    for (const m of out) $("#grid").appendChild(card(m));
+    done = srcs.every((s) => s.done && !s.buf.length);
     const n = $("#grid").children.length;
     $("#status").textContent = n ? "" : (query ? "Ningún vídeo coincide con la búsqueda." : "Este canal no tiene vídeos.");
     $("#more").classList.toggle("hidden", done || !n);
@@ -282,7 +309,9 @@ function info(m) {
     if (a.className === "DocumentAttributeFilename") name = a.fileName;
   }
   const cap = (m.message || "").split("\n")[0].trim();
-  return { doc, dur, title: cap || name || "Vídeo " + m.id, size: Number(doc.size.toString()) };
+  let mime = doc.mimeType || "";
+  if (!/^video\//.test(mime)) mime = EXT_MIME[(name.split(".").pop() || "").toLowerCase()] || "video/mp4";
+  return { doc, dur, mime, title: cap || name || "Vídeo " + m.id, size: Number(doc.size.toString()) };
 }
 
 function card(m) {
@@ -412,11 +441,11 @@ class TgSource {
 }
 
 function play(m) {
-  const { doc, title, size } = info(m);
+  const { doc, title, size, mime } = info(m);
   const id = m.id + "-" + Date.now();
   const s = { id, doc, entity, msgId: m.id, size };
   streams.set(id, s);
-  cur = { s, mime: doc.mimeType || "video/mp4", mode: "native" };
+  cur = { s, mime, mode: "native" };
   $("#ptitle").textContent = title;
   $("#perr").classList.add("hidden"); note("");
   $("#pcompat").classList.remove("hidden");
