@@ -62,17 +62,9 @@ main{padding:20px;max-width:1400px;margin:0 auto}
       <button class="btn" id="b-creds">Guardar</button>
     </div>
 
-    <div id="s-phone" class="hidden" style="display:grid;gap:12px">
-      <p>Entra con tu cuenta de Telegram. Te llegará un código a la app.</p>
-      <input id="phone" type="tel" placeholder="+34 600 000 000" autocomplete="tel">
-      <button class="btn" id="b-phone">Enviar código</button>
-    </div>
-
-    <div id="s-code" class="hidden" style="display:grid;gap:12px">
-      <p id="code-note">Escribe el código que te ha enviado Telegram.</p>
-      <input id="code" inputmode="numeric" placeholder="Código" autocomplete="one-time-code">
-      <button class="btn" id="b-code">Entrar</button>
-      <button class="btn ghost" id="b-resend">Enviar por SMS</button>
+    <div id="s-qr" class="hidden" style="display:grid;gap:12px;justify-items:center;text-align:center">
+      <div id="qr" style="background:#fff;border-radius:10px;padding:6px;width:240px;height:240px;display:grid;place-items:center;color:#333">Generando QR…</div>
+      <p>En el móvil abre Telegram, ve a <b>Ajustes &gt; Dispositivos &gt; Vincular dispositivo de escritorio</b> y escanea este código con ese lector.</p>
     </div>
 
     <div id="s-pwd" class="hidden" style="display:grid;gap:12px">
@@ -125,10 +117,10 @@ const streams = new Map(), blocks = new Map();
 
 /* ---------- login ---------- */
 function step(name) {
-  for (const id of ["creds", "phone", "code", "pwd"]) $("#s-" + id).classList.toggle("hidden", id !== name);
+  for (const id of ["creds", "qr", "pwd"]) $("#s-" + id).classList.toggle("hidden", id !== name);
   $("#lload").classList.add("hidden");
   $("#lerr").textContent = "";
-  const focus = { creds: "#api-id", phone: "#phone", code: "#code", pwd: "#pwd" }[name];
+  const focus = { creds: "#api-id", pwd: "#pwd" }[name];
   if (focus) $(focus).focus();
 }
 const fail = (e) => { $("#lerr").textContent = humanError(e); };
@@ -151,8 +143,8 @@ async function boot() {
     client = new TelegramClient(new StringSession(localStorage.tg_session || ""), apiId, apiHash, { connectionRetries: 5, useWSS: true });
     await client.connect();
     if (await client.checkAuthorization()) return startApp();
-    step("phone");
-  } catch (e) { step("phone"); fail(e); }
+    qrLogin();
+  } catch (e) { fail(e); }
 }
 
 $("#b-creds").onclick = () => {
@@ -162,46 +154,36 @@ $("#b-creds").onclick = () => {
   $("#lload").classList.remove("hidden"); boot();
 };
 
-let phone, codeHash;
-$("#b-phone").onclick = async () => {
-  phone = $("#phone").value.replace(/\s+/g, "");
+let pwdResolve = null;
+function qrUrl(token) {
+  let s = ""; for (const b of token) s += String.fromCharCode(b);
+  return "tg://login?token=" + btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function showQr(token) {
+  const q = TG.qrcode(0, "M");
+  q.addData(qrUrl(token)); q.make();
+  $("#qr").innerHTML = q.createSvgTag({ cellSize: 6, margin: 2, scalable: true });
+  const svg = $("#qr svg"); svg.style.width = "100%"; svg.style.height = "100%";
+}
+async function qrLogin() {
+  step("qr");
   try {
-    const r = await client.sendCode({ apiId, apiHash }, phone);
-    codeHash = r.phoneCodeHash; step("code");
-    $("#code-note").textContent = r.isCodeViaApp
-      ? "Telegram ha enviado el código a su app, no por SMS. Mira el chat oficial «Telegram» en tu móvil u ordenador donde ya tengas la sesión abierta. Si no tienes ninguno, pulsa «Enviar por SMS»."
-      : "Telegram ha enviado el código por SMS al número indicado.";
-  } catch (e) { fail(e); }
-};
-$("#b-resend").onclick = async () => {
-  try {
-    const r = await client.invoke(new Api.auth.ResendCode({ phoneNumber: phone, phoneCodeHash: codeHash }));
-    codeHash = r.phoneCodeHash;
-    $("#lerr").textContent = "";
-    $("#code-note").textContent = "Código reenviado. Si has pedido varios seguidos, espera unos minutos: Telegram limita los reenvíos.";
-  } catch (e) {
-    fail(/SEND_CODE_UNAVAILABLE/.test(String(e.errorMessage)) ? "Telegram no permite más reenvíos por ahora. Espera unos minutos o usa el código de la app." : e);
-  }
-};
-$("#b-code").onclick = async () => {
-  try {
-    await client.invoke(new Api.auth.SignIn({ phoneNumber: phone, phoneCodeHash: codeHash, phoneCode: $("#code").value.trim() }));
-    startApp();
-  } catch (e) {
-    if (e.errorMessage === "SESSION_PASSWORD_NEEDED") step("pwd"); else fail(e);
-  }
-};
-$("#b-pwd").onclick = async () => {
-  try {
-    await client.signInWithPassword({ apiId, apiHash }, {
-      password: async () => $("#pwd").value,
-      onError: async (e) => { fail(e); return true; },
+    await client.signInUserWithQrCode({ apiId, apiHash }, {
+      qrCode: async ({ token }) => { showQr(token); },
+      password: async () => {
+        const msg = $("#lerr").textContent;
+        step("pwd"); $("#lerr").textContent = msg;
+        return new Promise((res) => { pwdResolve = res; });
+      },
+      onError: async (e) => { fail(e); return !/PASSWORD_HASH_INVALID/.test(String(e.errorMessage || e.message)); },
     });
     startApp();
-  } catch (e) { if (!/AUTH_USER_CANCEL/.test(String(e.message))) fail(e); }
-};
-for (const [inp, btn] of [["#phone", "#b-phone"], ["#code", "#b-code"], ["#pwd", "#b-pwd"]])
-  $(inp).addEventListener("keydown", (e) => e.key === "Enter" && $(btn).click());
+  } catch (e) {
+    if (!/AUTH_USER_CANCEL/.test(String(e.message))) { fail(e); $("#qr").innerHTML = '<button class="btn" id="b-retry">Generar otro QR</button>'; $("#b-retry").onclick = qrLogin; }
+  }
+}
+$("#b-pwd").onclick = () => { if (pwdResolve) { $("#lerr").textContent = ""; pwdResolve($("#pwd").value); pwdResolve = null; } };
+$("#pwd").addEventListener("keydown", (e) => e.key === "Enter" && $("#b-pwd").click());
 
 $("#logout").onclick = async () => {
   try { await client.invoke(new Api.auth.LogOut()); } catch (_) {}
