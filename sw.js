@@ -23,7 +23,9 @@ async function serve(e, id, size, mime) {
   if (start >= size) return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${size}` } });
   end = Math.min(end, start + CHUNK - 1);
 
-  const client = (await self.clients.get(e.clientId)) || (await self.clients.matchAll({ type: "window" }))[0];
+  // Si la petición viene de un Worker (p. ej. el de un reproductor), el cliente no es la página: usamos una ventana.
+  let client = await self.clients.get(e.clientId);
+  if (!client || client.type !== "window") client = (await self.clients.matchAll({ type: "window" }))[0];
   if (!client) return new Response("Sin página activa", { status: 503 });
 
   try {

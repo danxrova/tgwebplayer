@@ -45,10 +45,13 @@ main{padding:20px;max-width:1400px;margin:0 auto}
 #player{position:fixed;inset:0;background:rgba(8,9,12,.92);z-index:10;display:grid;grid-template-rows:auto 1fr;padding:12px 16px;gap:10px}
 #player .bar{display:flex;gap:12px;align-items:center}
 #player .bar b{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#player video{width:100%;height:100%;min-height:0;background:#000;border-radius:10px}
+#player .stage{min-height:0;position:relative}
+#player video,#mwrap{width:100%;height:100%;min-height:0;background:#000;border-radius:10px}
+#mwrap{overflow:hidden}
+#mwrap movi-player{display:block;width:100%;height:100%}
+#player .bar .btn{padding:7px 12px;font-size:13px}
 #perr{color:var(--danger);margin:0}
-#pstat{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%}
-#player .bar{flex-wrap:wrap}
+#pnote{color:var(--muted);margin:0}
 </style>
 </head>
 <body>
@@ -95,8 +98,12 @@ main{padding:20px;max-width:1400px;margin:0 auto}
 </div>
 
 <div id="player" class="hidden" role="dialog" aria-label="Reproductor">
-  <div class="bar"><b id="ptitle"></b><span id="pstat" aria-live="polite"></span><button class="btn ghost" id="pcompat" title="Convierte el vídeo en tiempo real a H.264/AAC (sirve para cualquier códec o formato)">Modo compatible</button><button class="btn ghost" id="pclose">Cerrar</button></div>
-  <video id="video" controls playsinline></video>
+  <div class="bar"><b id="ptitle"></b><button class="btn ghost" id="pcompat" title="Reproduce con ffmpeg.wasm (más lento, pero admite casi cualquier códec)">Compatibilidad total</button><button class="btn ghost" id="pclose">Cerrar</button></div>
+  <div class="stage">
+    <video id="video" controls playsinline></video>
+    <div id="mwrap" class="hidden"></div>
+  </div>
+  <p id="pnote" class="hidden"></p>
   <p id="perr" class="hidden"></p>
 </div>
 
@@ -106,7 +113,6 @@ main{padding:20px;max-width:1400px;margin:0 auto}
 window.CONFIG = { API_ID: 0, API_HASH: "", CHANNEL: "" };
 </script>
 <script src="tg.js"></script>
-<script src="fallback.js"></script>
 <script>
 const { TelegramClient, Api, StringSession, bigInt } = TG;
 const $ = (s) => document.querySelector(s);
@@ -374,86 +380,104 @@ async function readRange(id, start, end) {
 }
 
 /* ---------- reproductor ---------- */
-const video = $("#video");
-let mode = "native";   // "native": el navegador decodifica | "compat": conversión en vivo con ffmpeg.wasm
-let cur = null, hinted = false;
+// Primero se usa el <video> nativo (rápido y con aceleración por hardware).
+// Solo si el navegador no soporta el códec/contenedor, se carga movi-player (FFmpeg WASM + WebCodecs).
+const MOVI_URL = "https://cdn.jsdelivr.net/npm/movi-player/dist/element.js";
+const video = $("#video"), mwrap = $("#mwrap");
+let cur = null, moviEl = null, moviLoad = null;
 
-const setStat = (t) => { $("#pstat").textContent = t || ""; };
+const note = (t) => { const n = $("#pnote"); n.textContent = t || ""; n.classList.toggle("hidden", !t); };
 const showErr = (t) => { const e = $("#perr"); e.textContent = t; e.classList.remove("hidden"); };
-function setMode(m) {
-  mode = m;
-  $("#pcompat").textContent = m === "compat" ? "Modo normal" : "Modo compatible";
-}
-const hasCompat = () => !!(window.Compat && Compat.supported());
 
-function loadNative() {
-  setMode("native");
-  setStat("");
-  $("#perr").classList.add("hidden");
-  hinted = false;
-  video.src = `tg-stream/${cur.id}?s=${cur.size}&t=${encodeURIComponent(cur.mime || "video/mp4")}`;
+// Adaptador de origen para movi-player: lee los bytes directamente de Telegram (sin pasar por el Service Worker).
+class TgSource {
+  constructor(s) { this.s = s; this.pos = 0; }
+  async getSize() { return this.s.size; }
+  async read(offset, length) {
+    const end = Math.min(offset + length, this.s.size) - 1;
+    if (offset > end) return new ArrayBuffer(0);
+    this.pos = offset;
+    const SLICE = 4 * 1024 * 1024, parts = [];
+    for (let o = offset; o <= end; o += SLICE)
+      parts.push(new Uint8Array(await readRange(this.s.id, o, Math.min(o + SLICE - 1, end))));
+    if (parts.length === 1) return parts[0].buffer;
+    const out = new Uint8Array(parts.reduce((a, p) => a + p.length, 0));
+    let k = 0; for (const p of parts) { out.set(p, k); k += p.length; }
+    return out.buffer;
+  }
+  seek(o) { this.pos = o; return o; }
+  getPosition() { return this.pos; }
+  close() {}
+  getKey() { return "tg:" + this.s.id; }
+}
+
+function play(m) {
+  const { doc, title, size } = info(m);
+  const id = m.id + "-" + Date.now();
+  const s = { id, doc, entity, msgId: m.id, size };
+  streams.set(id, s);
+  cur = { s, mime: doc.mimeType || "video/mp4", mode: "native" };
+  $("#ptitle").textContent = title;
+  $("#perr").classList.add("hidden"); note("");
+  $("#pcompat").classList.remove("hidden");
+  $("#player").classList.remove("hidden");
+  destroyMovi();
+  video.classList.remove("hidden");
+  video.src = `tg-stream/${id}?s=${size}&t=${encodeURIComponent(cur.mime)}`;
   video.play().catch(() => {});
 }
-function play(m) {
-  const { doc, title, size, dur } = info(m);
-  const id = m.id + "-" + Date.now();
-  streams.set(id, { id, doc, entity, msgId: m.id, size });
-  if (window.Compat) Compat.stop();
-  cur = { id, size, dur, mime: doc.mimeType };
-  $("#ptitle").textContent = title;
-  $("#player").classList.remove("hidden");
-  loadNative();
+
+function destroyMovi() {
+  if (moviEl) { try { moviEl.pause(); } catch (_) {} moviEl.remove(); moviEl = null; }
+  mwrap.classList.add("hidden");
 }
 
-// Conversión en vivo (cualquier códec/contenedor -> H.264 + AAC) cuando el navegador no puede reproducirlo.
-async function startCompat(reason) {
-  if (!cur) return;
-  if (!hasCompat()) return showErr("Este navegador no puede convertir vídeo (necesita WebAssembly y Media Source). Ábrelo desde Telegram.");
-  const c = cur;
-  setMode("compat");
+async function useMovi(startAt, reason) {
+  if (!cur || cur.mode === "movi") return;
+  const me = cur; me.mode = "movi";
+  video.pause(); video.removeAttribute("src"); video.load();
+  video.classList.add("hidden");
+  $("#pcompat").classList.add("hidden");
   $("#perr").classList.add("hidden");
-  video.pause(); video.removeAttribute("src"); video.load();
-  setStat(reason || "Preparando la conversión…");
-  await Compat.start({
-    video, size: c.size, duration: c.dur,
-    read: (s, e) => readRange(c.id, s, e),
-    onStatus: setStat,
-    onError: (msg) => { setStat(""); showErr(msg); },
-  });
-  if (cur !== c) Compat.stop(); // se cerró el reproductor mientras arrancaba
+  note((reason ? reason + " " : "") + "Cargando el reproductor de compatibilidad (la primera vez descarga ~2 MB)…");
+  try {
+    await (moviLoad ||= import(MOVI_URL).catch((e) => { moviLoad = null; throw e; }));
+    await customElements.whenDefined("movi-player");
+    if (cur !== me) return;
+    const el = document.createElement("movi-player");
+    el.setAttribute("controls", ""); el.setAttribute("autoplay", ""); el.setAttribute("playsinline", "");
+    if (startAt > 1) el.setAttribute("startat", String(Math.floor(startAt)));
+    el.addEventListener("error", (ev) => { note(""); showErr("No se ha podido reproducir el vídeo: " + ((ev.detail && ev.detail.message) || "error desconocido")); });
+    mwrap.appendChild(el); moviEl = el;
+    mwrap.classList.remove("hidden");
+    if ("sourceAdapter" in el) el.sourceAdapter = new TgSource(me.s);
+    else el.src = `tg-stream/${me.s.id}?s=${me.s.size}&t=${encodeURIComponent(me.mime)}`; // versiones antiguas: vía Service Worker
+    note("");
+  } catch (e) {
+    if (cur !== me) return;
+    note("");
+    showErr("No se ha podido cargar el reproductor de compatibilidad: " + (e.message || e) + ". Si es un MKV u otro formato poco común, ábrelo desde Telegram.");
+  }
 }
 
+// Fallo claro del navegador (códec o contenedor no soportado)
 video.addEventListener("error", () => {
-  if (!cur) return;
-  if (mode === "native" && hasCompat()) return startCompat("Formato no compatible con el navegador: convirtiendo en tiempo real…");
-  showErr(mode === "compat"
-    ? "No se ha podido reproducir el vídeo convertido."
-    : "No se puede reproducir este vídeo en el navegador. Ábrelo desde Telegram.");
+  if (cur && cur.mode === "native") useMovi(0, "El navegador no puede reproducir este formato.");
 });
-// Imagen no decodificable (p. ej. HEVC sin soporte): el navegador carga el archivo pero no hay vídeo.
+// Caso típico de HEVC/AV1 sin soporte: el audio carga pero no hay imagen (videoWidth = 0)
 video.addEventListener("loadedmetadata", () => {
-  if (cur && mode === "native" && video.videoWidth === 0) startCompat("El navegador no decodifica la imagen de este vídeo: convirtiendo…");
+  if (cur && cur.mode === "native" && video.videoWidth === 0)
+    useMovi(0, "El navegador no soporta el códec de vídeo.");
 });
-// Audio no decodificable (AC-3, DTS…): Chrome/Safari lo delatan con este contador.
-video.addEventListener("timeupdate", () => {
-  if (mode !== "native" || hinted || video.paused || video.currentTime < 4) return;
-  hinted = true;
-  if (typeof video.webkitAudioDecodedByteCount === "number" && video.webkitAudioDecodedByteCount === 0)
-    setStat("¿No se oye nada? Prueba el «Modo compatible».");
-});
-$("#pcompat").onclick = () => {
-  if (!cur) return;
-  if (mode === "native") return startCompat("Preparando la conversión…");
-  Compat.stop();
-  video.pause(); video.removeAttribute("src"); video.load();
-  loadNative();
-};
+// Manual: por ejemplo, el vídeo se ve pero no suena (códec de audio como AC-3/DTS)
+$("#pcompat").onclick = () => useMovi(video.currentTime || 0, "");
 
 function closePlayer() {
+  if (cur) streams.delete(cur.s.id);
   cur = null;
-  if (window.Compat) Compat.stop();
   video.pause(); video.removeAttribute("src"); video.load();
-  setStat(""); setMode("native");
+  destroyMovi();
+  note(""); $("#perr").classList.add("hidden");
   $("#player").classList.add("hidden");
 }
 $("#pclose").onclick = closePlayer;
